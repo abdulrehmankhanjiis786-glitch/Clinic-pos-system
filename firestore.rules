@@ -1,0 +1,74 @@
+rules_version = '2';
+
+// FREE-PLAN DESIGN: there is no server code. These rules are the only
+// enforcement, so they are strict. Roles live in the users/{uid} document,
+// and only an active Admin can create or change those documents.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function profilePath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+    function hasProfile() {
+      return signedIn() && exists(profilePath());
+    }
+    function profile() {
+      return get(profilePath()).data;
+    }
+    function active() {
+      return hasProfile() && profile().disabled == false;
+    }
+    function role() {
+      return profile().role;
+    }
+    function isAdmin() {
+      return active() && role() == 'admin';
+    }
+
+    match /users/{uid} {
+      // Everyone may read their own profile (the app needs it, even if disabled).
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+
+      // Admin creates Receptionist / Developer profiles. Admin profiles are
+      // created only by hand in the Firebase console.
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(
+             ['username', 'displayName', 'role', 'recoveryEmail', 'disabled', 'createdAt', 'createdBy'])
+        && request.resource.data.role in ['receptionist', 'developer']
+        && request.resource.data.disabled == false
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time;
+
+      // Admin may only switch non-admin accounts on or off. Nobody can change roles.
+      allow update: if isAdmin()
+        && resource.data.role != 'admin'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['disabled'])
+        && request.resource.data.disabled is bool;
+
+      allow delete: if false;
+    }
+
+    // Audit log: add-only. Nobody can edit or delete entries. Only Admin can read.
+    match /auditLogs/{eventId} {
+      allow read: if isAdmin();
+      allow create: if active()
+        && request.resource.data.keys().hasOnly(
+             ['uid', 'role', 'action', 'entityType', 'entityId', 'details', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.role == role()
+        && request.resource.data.action is string
+        && request.resource.data.action.size() < 60
+        && request.resource.data.details is map
+        && request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
